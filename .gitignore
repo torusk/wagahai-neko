@@ -1,0 +1,31 @@
+# dependencies
+node_modules/
+
+# build output
+out/
+dist/
+*.tgz
+
+# video asset (Pixabay license — download separately, see README)
+neko.mp4
+
+# logs & caches
+*.log
+.cache/
+*.tsbuildinfo
+*.lcov
+coverage/
+
+# env files
+.env
+.env.*
+
+# editor & OS
+.DS_Store
+.idea/
+.vscode/
+.cursor/
+
+# Claude Code internal files
+.claude/
+CLAUDE.md

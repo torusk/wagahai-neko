@@ -1,0 +1,16 @@
+{
+  "name": "wagahai-neko",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "吾輩は猫である — text flows around a chroma-key cat in real time",
+  "scripts": {
+    "dev": "bun run server.ts"
+  },
+  "dependencies": {
+    "@chenglou/pretext": "^0.0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
