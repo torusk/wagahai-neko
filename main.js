@@ -10,90 +10,101 @@ canvas.width = W;
 canvas.height = H;
 
 // ---- Layout constants ----
-const FONT_SIZE = 14;
-const LINE_HEIGHT = 21;
-const MARGIN = 28;
-const HEADER_HEIGHT = 118; // reserved for title + author + rule
+const FONT_SIZE     = 18;
+const LINE_HEIGHT   = 26;
+const MARGIN        = 28;
+const HEADER_HEIGHT = 118;
 const FONT = `${FONT_SIZE}px "Hiragino Mincho ProN", "Yu Mincho", "BIZ UDMincho Medium", serif`;
+
+// ---- Cat scaling ----
+const CAT_SCALE    = 1 / 3;
+const BBOX_MARGIN  = 15; // source-space pixels added around cat bounding box
 
 // ---- Colors ----
 const TEXT_COLOR  = '#1a1204';
 const TITLE_COLOR = '#0d0a04';
-const RULE_COLOR  = '#c4b49a';
-const META_COLOR  = '#7a6a55';
+const RULE_COLOR  = '#ccc0b0';
+const META_COLOR  = '#888070';
 
-// ---- Cat silhouette padding ----
-const CAT_PAD_X = 7;
-const CAT_PAD_Y = 4;
+// ---- Obstacle padding around cat silhouette ----
+const CAT_PAD_X = 8;
+const CAT_PAD_Y = 5;
 
-// ---- Offscreen: video frame processing ----
+// ---- Full-resolution offscreen for video processing ----
 const offscreen = document.createElement('canvas');
-offscreen.width = W;
+offscreen.width  = W;
 offscreen.height = H;
 const offCtx = offscreen.getContext('2d', { willReadFrequently: true });
 
-// ---- Paper texture (generated once) ----
-const paperCanvas = document.createElement('canvas');
-paperCanvas.width = W;
-paperCanvas.height = H;
-generatePaperTexture();
-
-function generatePaperTexture() {
-  const pc = paperCanvas.getContext('2d');
-
-  // Warm cream base
-  pc.fillStyle = '#f4edd8';
-  pc.fillRect(0, 0, W, H);
-
-  // Subtle aged-paper gradient (slightly darker at edges)
-  const vignette = pc.createRadialGradient(W / 2, H / 2, H * 0.2, W / 2, H / 2, H * 0.9);
-  vignette.addColorStop(0, 'rgba(0,0,0,0)');
-  vignette.addColorStop(1, 'rgba(0,0,0,0.06)');
-  pc.fillStyle = vignette;
-  pc.fillRect(0, 0, W, H);
-
-  // Fine grain noise (deterministic LCG so it never changes)
-  const img = pc.getImageData(0, 0, W, H);
-  const d = img.data;
-  let s = 0xdeadbeef;
-  const rnd = () => { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return (s >>> 0) / 0xffffffff; };
-  for (let i = 0; i < d.length; i += 4) {
-    const v = (rnd() - 0.5) * 11;
-    d[i]   = Math.min(255, Math.max(0, d[i]   + v));
-    d[i+1] = Math.min(255, Math.max(0, d[i+1] + v * 0.88));
-    d[i+2] = Math.min(255, Math.max(0, d[i+2] + v * 0.62));
-  }
-  pc.putImageData(img, 0, 0);
-}
-
-// ---- Strip inline furigana from Aozora-style text ----
-// e.g. 吾輩わがはい → 吾輩, 見当けんとう → 見当
-// Keep okurigana: single kanji + ≤2 hiragana (食べる, 泣いて, etc.)
-function stripFurigana(text) {
-  return text.replace(/([一-龯々]{1,4})([ぁ-ん]{2,8})/g, (_, kanji, hira) => {
-    if (kanji.length === 1 && hira.length <= 2) return kanji + hira;
-    return kanji;
-  });
-}
-
-// ---- Green-screen helpers ----
+// ---- Green-screen removal + spill suppression + bounding box ----
 function isGreen(r, g, b) {
   return g > 90 && (g - r) > 35 && (g - b) > 35;
 }
 
-function buildCatMask(data) {
-  const mask = new Uint8Array(W * H);
+function processFrame(data) {
+  const catMask = new Uint8Array(W * H);
+  let minX = W, minY = H, maxX = -1, maxY = -1;
+
   for (let i = 0, j = 0; j < data.length; i++, j += 4) {
-    if (!isGreen(data[j], data[j + 1], data[j + 2])) {
-      mask[i] = 1;
+    const r = data[j], g = data[j + 1], b = data[j + 2];
+
+    if (isGreen(r, g, b)) {
+      data[j + 3] = 0; // punch out green → transparent
     } else {
-      data[j + 3] = 0;
+      catMask[i] = 1;
+
+      // Green spill suppression on fringe pixels
+      const spill = g - Math.max(r, b);
+      if (spill > 5) data[j + 1] = Math.round(Math.max(r, b) + spill * 0.15);
+
+      // Track cat bounding box
+      const x = i % W;
+      const y = (i / W) | 0;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  if (maxX < 0) return { catMask, bbox: null }; // no cat found
+
+  // Expand bounding box by a margin and clamp to canvas
+  const bx = Math.max(0, minX - BBOX_MARGIN);
+  const by = Math.max(0, minY - BBOX_MARGIN);
+  const bbox = {
+    x: bx,
+    y: by,
+    w: Math.min(W, maxX + BBOX_MARGIN + 1) - bx,
+    h: Math.min(H, maxY + BBOX_MARGIN + 1) - by,
+  };
+
+  return { catMask, bbox };
+}
+
+// ---- Build a sparse obstacle mask sized to the main canvas ----
+// Maps each pixel in the scaled destination rect back to source catMask.
+function buildScaledMask(catMask, bbox, destX, destY, destW, destH) {
+  const mask   = new Uint8Array(W * H);
+  const scaleX = bbox.w / destW;
+  const scaleY = bbox.h / destH;
+  const x0 = Math.max(0, destX),  x1 = Math.min(W, destX + destW);
+  const y0 = Math.max(0, destY),  y1 = Math.min(H, destY + destH);
+
+  for (let my = y0; my < y1; my++) {
+    const srcY = Math.round(bbox.y + (my - destY) * scaleY);
+    if (srcY < 0 || srcY >= H) continue;
+    for (let mx = x0; mx < x1; mx++) {
+      const srcX = Math.round(bbox.x + (mx - destX) * scaleX);
+      if (srcX >= 0 && srcX < W) {
+        mask[my * W + mx] = catMask[srcY * W + srcX];
+      }
     }
   }
   return mask;
 }
 
-// ---- Obstacle / slot helpers ----
+// ---- Obstacle / text-slot helpers ----
 function getBlockedIntervals(mask, lineTop, lineBottom) {
   const top    = Math.max(0, lineTop    - CAT_PAD_Y);
   const bottom = Math.min(H, lineBottom + CAT_PAD_Y);
@@ -105,8 +116,8 @@ function getBlockedIntervals(mask, lineTop, lineBottom) {
     for (let y = top; y < bottom && !hasCat; y++) {
       if (mask[y * W + x]) hasCat = true;
     }
-    if (hasCat && !inBlock)  { inBlock = true;  start = Math.max(0, x - CAT_PAD_X); }
-    if (!hasCat && inBlock)  { inBlock = false; intervals.push({ left: start, right: Math.min(W, x + CAT_PAD_X) }); }
+    if  (hasCat && !inBlock) { inBlock = true;  start = Math.max(0, x - CAT_PAD_X); }
+    if (!hasCat &&  inBlock) { inBlock = false; intervals.push({ left: start, right: Math.min(W, x + CAT_PAD_X) }); }
   }
   if (inBlock) intervals.push({ left: start, right: W });
   return intervals;
@@ -139,22 +150,29 @@ function carveSlots(blocked, lo, hi) {
   return slots;
 }
 
-// ---- Header: title, author, rule ----
+// ---- Strip inline furigana ----
+// e.g. 吾輩わがはい → 吾輩、見当けんとう → 見当
+// Keep okurigana: single kanji + ≤2 hiragana (食べる, 泣いて …)
+function stripFurigana(text) {
+  return text.replace(/([一-龯々]{1,4})([ぁ-ん]{2,8})/g, (_, kanji, hira) => {
+    if (kanji.length === 1 && hira.length <= 2) return kanji + hira;
+    return kanji;
+  });
+}
+
+// ---- Aozora Bunko-style header ----
 function drawHeader() {
   ctx.save();
   ctx.textBaseline = 'top';
 
-  // Title
   ctx.fillStyle = TITLE_COLOR;
   ctx.font = `bold 30px "Hiragino Mincho ProN", "Yu Mincho", serif`;
   ctx.fillText('吾輩は猫である', MARGIN, 16);
 
-  // Author
   ctx.fillStyle = META_COLOR;
   ctx.font = `17px "Hiragino Mincho ProN", "Yu Mincho", serif`;
   ctx.fillText('夏目漱石', MARGIN, 56);
 
-  // Horizontal rule
   ctx.strokeStyle = RULE_COLOR;
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -162,7 +180,6 @@ function drawHeader() {
   ctx.lineTo(W - MARGIN, 84);
   ctx.stroke();
 
-  // Chapter marker
   ctx.fillStyle = META_COLOR;
   ctx.font = `15px "Hiragino Mincho ProN", "Yu Mincho", serif`;
   ctx.textAlign = 'center';
@@ -172,7 +189,7 @@ function drawHeader() {
   ctx.restore();
 }
 
-// ---- Main render loop ----
+// ---- Render loop ----
 let prepared = null;
 
 function render() {
@@ -181,31 +198,45 @@ function render() {
     return;
   }
 
-  // Process video frame on offscreen canvas
+  // 1. Process full-res video frame on offscreen canvas
   offCtx.drawImage(video, 0, 0, W, H);
   const imageData = offCtx.getImageData(0, 0, W, H);
-  const mask = buildCatMask(imageData.data);
-  offCtx.putImageData(imageData, 0, 0);
+  const { catMask, bbox } = processFrame(imageData.data);
+  offCtx.putImageData(imageData, 0, 0); // green pixels are now transparent
 
-  // 1. Paper background
-  ctx.drawImage(paperCanvas, 0, 0);
+  // 2. Compute destination rect for the 1/3-scaled cat
+  let mask, destX = 0, destY = 0, destW = 0, destH = 0;
+  if (bbox) {
+    destW = Math.round(bbox.w * CAT_SCALE);
+    destH = Math.round(bbox.h * CAT_SCALE);
+    // Keep the cat's center at the same canvas position as in the original video
+    destX = Math.round(bbox.x + bbox.w / 2 - destW / 2);
+    destY = Math.round(bbox.y + bbox.h / 2 - destH / 2);
+    destX = Math.max(0, Math.min(W - destW, destX));
+    destY = Math.max(0, Math.min(H - destH, destY));
+    mask = buildScaledMask(catMask, bbox, destX, destY, destW, destH);
+  } else {
+    mask = new Uint8Array(W * H);
+  }
 
-  // 2. Header (title / author / rule)
+  // 3. White background
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, W, H);
+
+  // 4. Header
   drawHeader();
 
-  // 3. Body text — flows around cat, starts below header
+  // 5. Body text — flows around the scaled cat silhouette
   ctx.fillStyle = TEXT_COLOR;
   ctx.font = FONT;
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
 
   let cursor = { segmentIndex: 0, graphemeIndex: 0 };
-  const lo = MARGIN;
-  const hi = W - MARGIN;
 
   for (let y = HEADER_HEIGHT + LINE_HEIGHT; y <= H; y += LINE_HEIGHT) {
     const blocked = getBlockedIntervals(mask, y - LINE_HEIGHT, y);
-    const slots   = carveSlots(blocked, lo, hi);
+    const slots   = carveSlots(blocked, MARGIN, W - MARGIN);
 
     for (const slot of slots) {
       const slotW = slot.right - slot.left;
@@ -213,7 +244,6 @@ function render() {
 
       let line = layoutNextLine(prepared, cursor, slotW);
       if (line === null) {
-        // Text exhausted — loop from beginning
         cursor = { segmentIndex: 0, graphemeIndex: 0 };
         line = layoutNextLine(prepared, cursor, slotW);
         if (!line) continue;
@@ -224,8 +254,10 @@ function render() {
     }
   }
 
-  // 4. Cat on top of everything
-  ctx.drawImage(offscreen, 0, 0);
+  // 6. Draw scaled cat (bbox region → 1/3 size) on top of text
+  if (bbox) {
+    ctx.drawImage(offscreen, bbox.x, bbox.y, bbox.w, bbox.h, destX, destY, destW, destH);
+  }
 
   requestAnimationFrame(render);
 }
