@@ -266,7 +266,7 @@ function render() {
 async function init() {
   const resp = await fetch('/wagahai.txt');
   const raw  = await resp.text();
-  const text = stripFurigana(raw);
+  const text = raw;
 
   await document.fonts.ready;
   prepared = prepareWithSegments(text, FONT);
